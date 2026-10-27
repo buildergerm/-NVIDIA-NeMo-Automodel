@@ -398,6 +398,10 @@ class _DionConfigBase(OptimizerConfig):
 class MuonConfig(_DionConfigBase):
     """``dion.Muon`` — matrix-aware update for 2D+ params, scalar fallback for 1D."""
 
+    # Muon flattens rank-3 (experts, out, in) weights internally; sharded
+    # expert DTensors still fall back to the scalar group (mesh mismatch).
+    _supports_rank3: ClassVar[bool] = True
+
     mu: float = 0.95
     betas: tuple[float, float] = (0.9, 0.95)
     epsilon: float = 1e-8
@@ -415,6 +419,10 @@ class MuonConfig(_DionConfigBase):
 @dataclass
 class NorMuonConfig(_DionConfigBase):
     """``dion.NorMuon`` — Muon variant with neuron-wise normalization."""
+
+    # NorMuon flattens rank-3 (experts, out, in) weights internally; sharded
+    # expert DTensors still fall back to the scalar group (mesh mismatch).
+    _supports_rank3: ClassVar[bool] = True
 
     mu: float = 0.95
     muon_beta2: float = 0.95

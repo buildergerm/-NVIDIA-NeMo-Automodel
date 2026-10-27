@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import math
+import os
 
 import pytest
 import torch
@@ -575,3 +576,95 @@ class TestBuildOptimizerFactoryConfig:
 
         assert len(instantiate_calls) == 2
         assert len(optimizers) == 2
+
+
+class TestRank3ExpertGroupingGate:
+    """Rank-3 expert weights must only enter the matrix group on supported paths.
+
+    Review findings: legacy Dion rejects tensors above rank 2 and Dion2 fails
+    in ``dion2_pre_orthogonalize`` on the extra expert axis; Muon/NorMuon under
+    EP x ep_shard compose an optimizer group over the dense DP mesh while the
+    expert shards live on the EP/ep_shard subgroups — a group/mesh mismatch.
+    """
+
+    def _model_with_experts(self):
+        class WithExperts(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.dense = nn.Linear(4, 4)
+                self.experts_weight = nn.Parameter(torch.randn(3, 4, 8))  # (experts, out, in)
+
+        return WithExperts()
+
+    def test_rank3_falls_back_to_scalar_without_support(self):
+        from nemo_automodel.components.optim.dion import _separate_param_groups
+
+        groups = _separate_param_groups(
+            model=self._model_with_experts(), base_lr=1e-3, scalar_opt="adamw", weight_decay=0.0
+        )
+        matrix_shapes = [tuple(p.shape) for p in groups[0]["params"]]
+        vector_shapes = [tuple(p.shape) for p in groups[1]["params"]]
+        assert (4, 4) in matrix_shapes, "rank-2 dense stays in the matrix group"
+        assert (3, 4, 8) in vector_shapes, "rank-3 without support must use the scalar fallback"
+        assert (3, 4, 8) not in matrix_shapes
+
+    def test_rank3_enters_matrix_group_when_supported(self):
+        from nemo_automodel.components.optim.dion import _separate_param_groups
+
+        groups = _separate_param_groups(
+            model=self._model_with_experts(),
+            base_lr=1e-3,
+            scalar_opt="adamw",
+            weight_decay=0.0,
+            supports_rank3=True,
+        )
+        matrix_shapes = [tuple(p.shape) for p in groups[0]["params"]]
+        assert (3, 4, 8) in matrix_shapes, "supported rank-3 routes to the matrix group"
+
+    def test_sharded_rank3_dtensor_always_falls_back(self):
+        """Even with rank-3 support, a sharded expert DTensor's mesh can never
+        match the dense optimizer mesh, so it must stay on the scalar path."""
+        import torch.distributed as dist
+        import torch.distributed.tensor as dt
+
+        if not dist.is_available():
+            pytest.skip("torch.distributed unavailable")
+        os_environ = os.environ
+        os_environ.setdefault("MASTER_ADDR", "127.0.0.1")
+        os_environ.setdefault("MASTER_PORT", "29731")
+        if not dist.is_initialized():
+            dist.init_process_group("gloo", rank=0, world_size=1)
+        try:
+            from torch.distributed.device_mesh import DeviceMesh
+
+            mesh = DeviceMesh("cpu", torch.arange(1), mesh_dim_names=("dp",))
+            sharded = dt.DTensor.from_local(
+                torch.randn(3, 4, 8),
+                mesh,
+                [dt.Replicate(), dt.Replicate(), dt.Replicate()],
+            )
+
+            class WithSharded(nn.Module):
+                def __init__(self):
+                    super().__init__()
+                    self.experts_weight = nn.Parameter(sharded)
+
+            from nemo_automodel.components.optim.dion import _separate_param_groups
+
+            groups = _separate_param_groups(
+                model=WithSharded(), base_lr=1e-3, scalar_opt="adamw", weight_decay=0.0, supports_rank3=True
+            )
+            vector_shapes = [tuple(p.shape) for p in groups[1]["params"]]
+            assert (3, 4, 8) in vector_shapes, "sharded rank-3 DTensor must use the scalar fallback"
+            assert len(groups[0]["params"]) == 0
+        finally:
+            pass
+
+    @pytest.mark.parametrize(
+        "cls_name,expected",
+        [("MuonConfig", True), ("NorMuonConfig", True), ("DionConfig", False), ("Dion2Config", False)],
+    )
+    def test_optimizer_configs_declare_rank3_support(self, cls_name, expected):
+        import nemo_automodel.components.optim.optimizer as opt_mod
+
+        assert getattr(getattr(opt_mod, cls_name), "_supports_rank3", False) is expected

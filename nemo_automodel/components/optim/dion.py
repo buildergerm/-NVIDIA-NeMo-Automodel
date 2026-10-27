@@ -60,6 +60,8 @@ def _separate_param_groups(
     scalar_lr: float | None = None,
     embed_lr: float | None = None,
     lm_head_lr: float | None = None,
+    *,
+    supports_rank3: bool = False,
 ) -> list[dict[str, Any]]:
     """
     Separate model parameters into groups for Dion/Muon optimizers.
@@ -74,6 +76,14 @@ def _separate_param_groups(
         scalar_lr: Learning rate for scalar (vector/bias) params. Defaults to base_lr.
         embed_lr: Learning rate for embedding params. Defaults to scalar_lr or base_lr.
         lm_head_lr: Learning rate for lm_head. Defaults to base_lr / sqrt(d_in).
+        supports_rank3: Whether the concrete optimizer accepts rank-3 weights.
+            Dion-family optimizers do not all support the grouped-expert
+            (experts, out, in) layout: legacy Dion rejects tensors above rank
+            2, Dion2 fails in dion2_pre_orthogonalize on the extra expert
+            axis. When False (or the parameter is an already-sharded DTensor,
+            whose mesh never matches the resolved dense optimizer mesh),
+            rank>=2 expert tensors fall back to the scalar optimizer group —
+            the same supported path the ungrouped base takes.
     """
     matrix_params = []
     vector_params = []
@@ -102,9 +112,18 @@ def _separate_param_groups(
         # Muon applies to matrix-like weights. Grouped MoE expert tensors are
         # commonly rank-3 (experts, out, in); treating them as scalar AdamW
         # parameters creates two full-size moments for almost the entire model.
-        # Dion/Muon can flatten higher-rank tensors internally, so include every
-        # non-embedding/lm-head trainable weight with ndim >= 2.
-        if param.ndim >= 2:
+        # Rank-3 weights only route into the matrix group when the optimizer
+        # supports them AND they are unsharded plain tensors: an expert
+        # DTensor is sharded over the EP/ep_shard subgroups of the MoE mesh,
+        # while the optimizer's mesh is the resolved dense FSDP DP mesh — the
+        # two groups differ (e.g. EP2 x ep_shard2 -> matrix group [0,2] vs
+        # optimizer ranks [0,1,2,3]), so Muon/NorMuon updates would be applied
+        # with the wrong collective. Sharded experts keep the scalar fallback.
+        from torch.distributed.tensor import DTensor
+
+        is_sharded = isinstance(param, DTensor)
+        rank_ok = param.ndim >= 2 and (param.ndim == 2 or (supports_rank3 and not is_sharded))
+        if rank_ok:
             matrix_params.append(param)
         else:
             vector_params.append(param)
@@ -225,6 +244,10 @@ def build_dion_optimizer(
         scalar_lr=getattr(config, "scalar_lr", None),
         embed_lr=getattr(config, "embed_lr", None),
         lm_head_lr=getattr(config, "lm_head_lr", None),
+        # Only Muon/NorMuon can consume rank-3 expert weights (legacy Dion
+        # rejects tensors above rank 2; Dion2 fails in pre-orthogonalize on
+        # the extra expert axis).
+        supports_rank3=bool(getattr(config, "_supports_rank3", False)),
     )
 
     dion_mesh = _get_dion_mesh(device_mesh)
