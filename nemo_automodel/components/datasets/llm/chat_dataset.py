@@ -27,14 +27,13 @@ if TYPE_CHECKING:
     from transformers import PreTrainedTokenizerBase
 from torch.utils.data import Dataset
 
-from nemo_automodel.components.datasets.utils import default_collater
-
 from nemo_automodel.components.datasets.llm.formatting_utils import (
     _add_pad_token,
     _has_chat_template,
     _resolve_chat_template,
     format_chat_template,
 )
+from nemo_automodel.components.datasets.utils import default_collater
 
 
 def _is_hf_repo_id(val: str) -> bool:
