@@ -1580,6 +1580,7 @@ def neat_packed_vlm_collater(
     materialize_4d_mask: bool = True,
     *,
     packing: PackedSequenceContract = DEFAULT_PACKED_SEQUENCE_CONTRACT,
+    defer_flash_metadata: bool = False,
 ) -> dict:
     """Collater for neat-packed VLM sequences.
 
@@ -1612,6 +1613,9 @@ def neat_packed_vlm_collater(
             original positional slot for Python-call compatibility.
         packing: Structural model contract selecting the packed mask representation.
             Defaults to block-causal masking without packed-sequence metadata.
+        defer_flash_metadata: Keep Flash attention boundaries in a [batch, sequence]
+            map until decoder entry after pipeline splitting. Outside PP the
+            default retains the public one-dimensional cumulative-length kwargs.
         materialize_4d_mask: Whether SDPA/eager packing should expand the
             indexed ``[B, S]`` document map into a dense
             ``[B, 1, S, S]`` block-causal mask. Context-parallel VLM paths
@@ -1625,7 +1629,10 @@ def neat_packed_vlm_collater(
         For ``flash_varlen``, the attention mask is omitted; ``cu_seq_lens_q``
         and ``cu_seq_lens_k`` have shape [segments + 1] and include physical
         padding runs. ``max_length_q`` and ``max_length_k`` are Python ints.
-        Optional ``_packed_seq_ids`` has shape [batch, sequence]. Media values,
+        With ``defer_flash_metadata``, a [batch, sequence] ``_packed_seq_ids``
+        map replaces these cumulative kwargs until decoder entry after PP splitting.
+        Optional ``_packed_seq_ids`` has shape [batch, sequence]. It is retained
+        for multiple-document packs, CP, or models requesting boundaries or metadata. Media values,
         grids, image positions, and timestamps concatenate their leading axis
         while preserving their trailing axes; variable-resolution media remain
         a flattened list of per-image tensors. Pixel values are cast to bfloat16.
@@ -1681,9 +1688,9 @@ def neat_packed_vlm_collater(
         # The HF varlen path replaces it with explicit cumulative lengths below.
         attention_mask_out = attention_mask
     else:
-        from nemo_automodel.components.datasets.utils import _indexed_mask_to_4d_block_causal
+        from nemo_automodel.components.datasets.utils import indexed_mask_to_4d_block_causal
 
-        attention_mask_out = _indexed_mask_to_4d_block_causal(attention_mask)
+        attention_mask_out = indexed_mask_to_4d_block_causal(attention_mask)
 
     # Handle position_ids: 1D [seq_len] or 3D mRoPE [3, seq_len]
     pos_sample = torch.as_tensor(batch[0]["position_ids"])
@@ -1717,17 +1724,16 @@ def neat_packed_vlm_collater(
         # HF consumes physical offsets, including padding, without an attention
         # mask. Native FA4's unpadded offsets below have a different contract.
         result.pop("attention_mask")
-        result.update(to_flash_attention_kwargs(packed_seq_params_from_doc_ids(attention_mask)))
-    if packing.requires_packed_sequence_metadata:
+        if not defer_flash_metadata:
+            result.update(to_flash_attention_kwargs(packed_seq_params_from_doc_ids(attention_mask)))
+    if packing.return_packed_sequence_metadata:
         result.update(build_packed_sequence_metadata(attention_mask))
 
     # Store indexed attention mask for loss functions that need per-sample
     # boundaries (e.g. SqrtCrossEntropy).  The indexed mask [B, S] uses
     # values 1,2,3,... per original sample and 0 for padding.  For SDPA the
     # ``attention_mask_out`` is already converted to 4D, so keep a copy.
-    has_multiple_docs = attention_mask.numel() > 0 and bool(attention_mask.max().item() > 1)
-    if has_multiple_docs or not materialize_4d_mask or packing.requires_packed_sequence_metadata:
-        result["_packed_seq_ids"] = attention_mask
+    result["_packed_seq_ids"] = attention_mask
 
     # Concatenate media tensors across batch (variable count, no padding needed)
     for key in ("pixel_values", "patch_pixel_values", "pixel_values_videos"):
