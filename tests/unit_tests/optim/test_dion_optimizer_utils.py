@@ -629,10 +629,10 @@ class TestRank3ExpertGroupingGate:
 
         if not dist.is_available():
             pytest.skip("torch.distributed unavailable")
-        os_environ = os.environ
-        os_environ.setdefault("MASTER_ADDR", "127.0.0.1")
-        os_environ.setdefault("MASTER_PORT", "29731")
-        if not dist.is_initialized():
+        os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+        os.environ.setdefault("MASTER_PORT", "29731")
+        created_group = not dist.is_initialized()
+        if created_group:
             dist.init_process_group("gloo", rank=0, world_size=1)
         try:
             from torch.distributed.device_mesh import DeviceMesh
@@ -658,7 +658,12 @@ class TestRank3ExpertGroupingGate:
             assert (3, 4, 8) in vector_shapes, "sharded rank-3 DTensor must use the scalar fallback"
             assert len(groups[0]["params"]) == 0
         finally:
-            pass
+            # Destroy only the group this test created: a leaked process group
+            # trips the session-level guard in isolation and skips later
+            # tests (e.g. FusedAdam local-shard checks) that expect a clean
+            # distributed state.
+            if created_group and dist.is_initialized():
+                dist.destroy_process_group()
 
     @pytest.mark.parametrize(
         "cls_name,expected",
