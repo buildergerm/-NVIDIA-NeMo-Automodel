@@ -657,3 +657,27 @@ class TestDropEmptyLocalShards:
         ]
         with pytest.raises(ValueError, match="param group 1"):
             _drop_empty_local_shards(groups)
+
+
+def test_dion_grouping_treats_grouped_expert_weights_as_muon_matrix_params():
+    import torch
+
+    from nemo_automodel.components.optim.dion import _separate_param_groups
+
+    class GroupedExperts(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.empty(8, 16, 32))
+            self.bias = torch.nn.Parameter(torch.empty(8, 16))
+
+    # Rank-3 expert weights route to the matrix group only for optimizers that
+    # declare rank-3 support (Muon/NorMuon); the default grouping falls back to
+    # the scalar optimizer — legacy Dion rejects tensors above rank 2 and
+    # Dion2 fails in pre-orthogonalize on the extra expert axis.
+    groups = _separate_param_groups(GroupedExperts(), 1e-4, "adamw", 0.0, supports_rank3=True)
+    assert groups[0]["params"][0].shape == (8, 16, 32)
+    assert all(param.ndim < 2 for param in groups[1]["params"])
+
+    fallback = _separate_param_groups(GroupedExperts(), 1e-4, "adamw", 0.0)
+    assert all(param.ndim < 3 for param in fallback[0]["params"]), "rank-3 without support uses the scalar fallback"
+    assert any(param.ndim == 3 for param in fallback[1]["params"])
