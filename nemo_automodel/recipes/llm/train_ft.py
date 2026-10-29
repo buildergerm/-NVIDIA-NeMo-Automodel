@@ -94,6 +94,7 @@ from nemo_automodel.components.loss.utils import (
 )
 from nemo_automodel.components.models.common.packing import PackingCapabilities
 from nemo_automodel.components.quantization.fp8 import build_fp8_config
+from nemo_automodel.components.speculative.mtp import compute_mtp_prefix_hits, simulated_accept_length
 from nemo_automodel.components.training.domain_mixture import WEIGHTED_AGGREGATE_NAME
 from nemo_automodel.components.training.model_output_utils import get_final_hidden_states
 from nemo_automodel.components.training.rng import ScopedRNG, StatefulRNG
@@ -1404,7 +1405,7 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                 )
                 mtp_per_depth_h = getattr(out, "mtp_per_depth_h", None)
                 mtp_per_depth_logits = getattr(out, "mtp_per_depth_logits", None)
-                if mtp_per_depth_h is not None or mtp_per_depth_logits is not None:
+                if is_train and (mtp_per_depth_h is not None or mtp_per_depth_logits is not None):
                     if mtp_per_depth_targets is not None or mtp_seq_idx is not None:
                         # CP targets or NEAT document IDs already define the boundaries.
                         mtp_cu_seqlens = None
@@ -1438,6 +1439,33 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
                         lm_weight=shared_lm_weight,
                         **loss_distributed_kwargs,
                     )
+                elif not is_train and (mtp_per_depth_h is not None or mtp_per_depth_logits is not None):
+                    # Eval-only: score against the verifier, no loss term added, so val_loss
+                    # stays main-head CE only (matches pre-metric behavior).
+                    verifier_logits = getattr(out, "logits", None)
+                    if (
+                        mtp_per_depth_targets is None  # CP-sharded verifier targets not supported yet
+                        and isinstance(verifier_logits, torch.Tensor)
+                        # Full-sequence logits, not a LinearCrossEntropy logits_to_keep=1 slice.
+                        and verifier_logits.dim() >= 2
+                        and verifier_logits.shape[-2] == labels.shape[-1]
+                    ):
+                        self._mtp_accept_metrics.append(
+                            compute_mtp_prefix_hits(
+                                model,
+                                mtp_per_depth_h=mtp_per_depth_h,
+                                mtp_per_depth_logits=mtp_per_depth_logits,
+                                verifier_logits=verifier_logits,
+                                labels=labels,
+                                ignore_index=ignore_index,
+                                seq_idx=mtp_seq_idx,
+                                cu_seqlens=mtp_cu_seqlens,
+                            )
+                        )
+                    # Drop the alias explicitly: unlike `out`, it isn't in the del
+                    # list below, so it would otherwise keep full-vocab logits
+                    # alive past this point.
+                    del verifier_logits
                 # Autograd retains tensors needed by the losses. Release the
                 # output container and auxiliary aliases before backward so
                 # unused full-vocabulary logits do not overlap its allocations.
@@ -1654,9 +1682,17 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         with ScopedRNG(seed=1, ranked=True):
             for mp in self.model_parts:
                 mp.eval()
+            # Native MTP forwards gate on self.training; models that expose compute_mtp_in_eval
+            # (today: nemotron_v3) opt eval back in so mtp_per_depth_h/_logits are actually produced.
+            mtp_eval_flags = [
+                (mp, mp.compute_mtp_in_eval) for mp in self.model_parts if hasattr(mp, "compute_mtp_in_eval")
+            ]
+            for mp, _ in mtp_eval_flags:
+                mp.compute_mtp_in_eval = True
 
             total_loss = torch.tensor(0.0, dtype=torch.float32, device=self.dist_env.device)
             total_num_label_tokens = 0
+            self._mtp_accept_metrics: list = []
 
             for batch in val_dataloader:
                 loss_buffer = []
@@ -1674,6 +1710,9 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
 
                 total_loss += torch.sum(torch.stack(loss_buffer)).item()
                 total_num_label_tokens += num_label_tokens
+
+            for mp, prev in mtp_eval_flags:
+                mp.compute_mtp_in_eval = prev
 
         total_loss = self._dp_allreduce(total_loss, include_cp=True)
         total_num_label_tokens = self._dp_allreduce(
@@ -1699,6 +1738,15 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
             "num_label_tokens": total_num_label_tokens,
             "mem": torch.cuda.max_memory_allocated() / 1024**3,
         }
+
+        # tau_sim: same metric/naming convention as the EAGLE-3 recipe's train/val tau_sim.
+        if self._mtp_accept_metrics:
+            mtp_prefix_hits = torch.stack([m.prefix_hits for m in self._mtp_accept_metrics]).sum(dim=0)
+            mtp_valid = torch.stack([m.valid for m in self._mtp_accept_metrics]).sum(dim=0)
+            mtp_prefix_hits = self._dp_allreduce(mtp_prefix_hits.to(self.dist_env.device), include_cp=True)
+            mtp_valid = self._dp_allreduce(mtp_valid.to(self.dist_env.device), include_cp=True)
+            if mtp_valid.sum().item() > 0:
+                metrics["val_mtp_tau_sim"] = simulated_accept_length(mtp_prefix_hits, mtp_valid).item()
 
         # Tool-call accuracy is the only signal that catches "loss going
         # down because format was learned but the model picks wrong tools".
